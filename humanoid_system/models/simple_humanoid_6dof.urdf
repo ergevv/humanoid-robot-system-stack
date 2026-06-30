@@ -1,0 +1,88 @@
+<?xml version="1.0"?>
+<!--
+  简化 6 自由度人形腿部模型。
+  这个 URDF 的目的不是描述某台真实机器人，而是让 Pinocchio 后端具备完整的
+  “URDF -> 模型 -> 足端 FK/Jacobian/速度”链路，便于后续替换成真实机器人 URDF。
+
+  关节顺序和仿真状态 q_j 保持一致：
+    0 left_hip_pitch
+    1 left_knee_pitch
+    2 left_ankle_pitch
+    3 right_hip_pitch
+    4 right_knee_pitch
+    5 right_ankle_pitch
+
+  当前解析模型使用 x = L*sin(q), z = -L*cos(q)。
+  URDF 中 pitch 轴取 0 -1 0，是为了让正关节角产生同样的前向 x 位移方向。
+-->
+<robot name="simple_humanoid_6dof">
+  <link name="base_link"/>
+
+  <link name="left_thigh_link"/>
+  <joint name="left_hip_pitch" type="revolute">
+    <parent link="base_link"/>
+    <child link="left_thigh_link"/>
+    <origin xyz="0 0.09 0" rpy="0 0 0"/>
+    <axis xyz="0 -1 0"/>
+    <limit lower="-2.5" upper="2.5" effort="120" velocity="12"/>
+  </joint>
+
+  <link name="left_shank_link"/>
+  <joint name="left_knee_pitch" type="revolute">
+    <parent link="left_thigh_link"/>
+    <child link="left_shank_link"/>
+    <origin xyz="0 0 -0.42" rpy="0 0 0"/>
+    <axis xyz="0 -1 0"/>
+    <limit lower="-2.8" upper="1.2" effort="120" velocity="12"/>
+  </joint>
+
+  <link name="left_foot_link"/>
+  <joint name="left_ankle_pitch" type="revolute">
+    <parent link="left_shank_link"/>
+    <child link="left_foot_link"/>
+    <origin xyz="0 0 -0.42" rpy="0 0 0"/>
+    <axis xyz="0 -1 0"/>
+    <limit lower="-1.5" upper="1.5" effort="80" velocity="12"/>
+  </joint>
+
+  <link name="left_sole_link"/>
+  <joint name="left_sole_fixed" type="fixed">
+    <parent link="left_foot_link"/>
+    <child link="left_sole_link"/>
+    <origin xyz="0 0 -0.08" rpy="0 0 0"/>
+  </joint>
+
+  <link name="right_thigh_link"/>
+  <joint name="right_hip_pitch" type="revolute">
+    <parent link="base_link"/>
+    <child link="right_thigh_link"/>
+    <origin xyz="0 -0.09 0" rpy="0 0 0"/>
+    <axis xyz="0 -1 0"/>
+    <limit lower="-2.5" upper="2.5" effort="120" velocity="12"/>
+  </joint>
+
+  <link name="right_shank_link"/>
+  <joint name="right_knee_pitch" type="revolute">
+    <parent link="right_thigh_link"/>
+    <child link="right_shank_link"/>
+    <origin xyz="0 0 -0.42" rpy="0 0 0"/>
+    <axis xyz="0 -1 0"/>
+    <limit lower="-2.8" upper="1.2" effort="120" velocity="12"/>
+  </joint>
+
+  <link name="right_foot_link"/>
+  <joint name="right_ankle_pitch" type="revolute">
+    <parent link="right_shank_link"/>
+    <child link="right_foot_link"/>
+    <origin xyz="0 0 -0.42" rpy="0 0 0"/>
+    <axis xyz="0 -1 0"/>
+    <limit lower="-1.5" upper="1.5" effort="80" velocity="12"/>
+  </joint>
+
+  <link name="right_sole_link"/>
+  <joint name="right_sole_fixed" type="fixed">
+    <parent link="right_foot_link"/>
+    <child link="right_sole_link"/>
+    <origin xyz="0 0 -0.08" rpy="0 0 0"/>
+  </joint>
+</robot>

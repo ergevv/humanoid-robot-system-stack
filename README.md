@@ -6,13 +6,14 @@
 
 ## 核心能力
 
-- 全身状态估计：维护 base 位姿、速度、IMU bias、关节状态、左右脚接触状态和协方差对角项。
+- 全身状态估计：维护 base 位姿、速度、CoM、IMU bias、关节状态、关节零偏、关节延迟、IMU 外参误差、左右脚接触状态和完整协方差矩阵。
 - IMU 传播：使用四元数更新姿态，并根据去偏后的加速度积分 base 位置和速度。
-- 编码器/运动学更新：通过简化腿部正运动学估计左右脚位置与速度，并用于接触判断。
-- 接触感知建模：估计左右脚接触概率、接触开关稳定性，并将接触约束反馈到状态速度修正。
+- 编码器/运动学更新：默认可用解析腿模型运行；启用 Pinocchio 后可从 URDF 计算足端位置、速度和解析雅可比。
+- 机器人模型配置校验：集中检查 URDF、左右足 frame、joint_order、floating base 等配置，并写入 summary。
+- 接触感知建模：估计左右脚接触概率、滑移评分、接触开关稳定性，并将可信接触约束反馈到状态速度修正。
 - 语义世界模型：维护二维 semantic occupancy grid，支持 ground、wall、obstacle、dynamic_object、human 等语义标签。
 - 动态目标跟踪：对感知检测结果做最近邻关联，估计目标位置、速度、不确定性和生命周期。
-- 规划接口：根据语义地图和接触状态生成 cost map、safe region 和文字化运动约束。
+- 规划接口：根据语义地图和接触状态生成 cost map、safe region、足底支撑多边形约束、CoM 支撑裕度和文字化运动约束。
 - 失效处理：检测 IMU 异常、编码器不一致、接触误检、传感器掉线、时间延迟和观测退化。
 - 仿真验证：内置平地、楼梯、快速行走、传感器掉线、接触误检五类场景。
 - 可视化：提供 Python 脚本绘制 base 轨迹、接触时间线、协方差变化和语义栅格图。
@@ -57,6 +58,9 @@ IMU / Encoder / Camera-LiDAR
 .
 ├── CMakeLists.txt
 ├── task.md
+├── docs
+│   ├── implementation_plan.md
+│   └── realism_gap.md
 ├── README.md
 └── humanoid_system
     ├── common
@@ -66,9 +70,14 @@ IMU / Encoder / Camera-LiDAR
     │   ├── imu_propagation.*
     │   ├── kinematics_pinocchio.*
     │   └── contact_estimator.*
+    ├── models
+    │   ├── simple_humanoid_6dof.urdf
+    │   └── unitree_g1_12dof
     ├── planning
     │   ├── cost_map.*
     │   └── constraint_generator.*
+    ├── robot_model
+    │   └── robot_model_config.*
     ├── sensors
     │   ├── camera
     │   ├── encoder
@@ -79,6 +88,8 @@ IMU / Encoder / Camera-LiDAR
     │   └── scenario_generator.*
     ├── system
     │   ├── data_bus.*
+    │   ├── sensor_buffer.*
+    │   ├── state_history_buffer.*
     │   └── real_time_loop.*
     ├── visualization
     │   └── plot_state.py
@@ -111,8 +122,11 @@ X = {
   R_wb, p_wb, v_wb,
   bg, ba,
   q_j, v_j,
+  joint_position_bias, joint_delay,
+  imu_extrinsic_rotation_error, imu_extrinsic_translation_error,
   contact_L, contact_R,
-  covariance_diag,
+  com_w,
+  covariance, covariance_diag,
   degenerate
 }
 ```
@@ -120,9 +134,22 @@ X = {
 主要文件：
 
 - `imu_propagation.*`：根据 IMU 角速度和加速度执行姿态、位置、速度传播。
-- `kinematics_pinocchio.*`：提供简化腿部正运动学接口，当前不依赖外部 Pinocchio 库。
-- `contact_estimator.*`：根据脚高度、脚速度、膝关节速度估计接触概率和接触稳定性。
+- `kinematics_pinocchio.*`：默认提供解析腿模型；启用 `HUMANOID_ENABLE_PINOCCHIO` 后从 URDF/Pinocchio 计算足端运动学和 frame Jacobian。
+- `contact_estimator.*`：根据脚高度、脚速度、膝关节速度估计接触概率、滑移评分和接触稳定性。
 - `eskf_whole_body.*`：集成 IMU propagation、encoder update、接触约束、协方差传播、失效检测和退化检测。
+
+当前内置仿真步态不是由 G1 URDF 动力学正向生成的，因此严格的“支撑脚速度=0”Kalman 量测默认关闭，summary 中会显示 `contact_velocity_update_enabled: 0`。如果接入真实机器人或 URDF 一致仿真，可设置 `HUMANOID_ENABLE_CONTACT_VELOCITY_UPDATE=1` 打开严格接触速度更新。
+
+为了抑制 IMU 纯积分漂移，估计器还实现了支撑脚锚点约束：脚进入稳定支撑时记录足端世界位置，支撑期间用该锚点修正 base 的横向和高度漂移。当前内置步态的关节轨迹不是严格逆运动学生成，所以锚点不修正前向 x，避免把正常前进误压成静止；真实机器人或一致动力学仿真中可进一步扩展为完整 3D 腿式里程计。
+
+### robot_model
+
+`robot_model_config.*` 集中管理真实机器人模型入口：
+
+- 读取 URDF 路径、左右足端 frame、joint_order 和 floating base 配置。
+- 支持 CMake cache 默认值，也支持运行时环境变量覆盖。
+- 对 URDF 文件、关节数量、关节名重复、左右足 frame 和 URDF 中的 joint 存在性做诊断。
+- 将诊断结果写入 `summary.txt`，帮助排查模型配置错误。
 
 ### world_model
 
@@ -146,12 +173,17 @@ X = {
 规划接口目前提供 cost map 和接触约束生成：
 
 - `CostMapBuilder`：将语义地图转为代价图，并根据 base 附近距离、接触状态和语义类别调整 cost。
-- `ConstraintGenerator`：根据双支撑、单支撑、无接触、估计退化和高不确定性生成约束描述。
+- `ConstraintGenerator`：根据双支撑、单支撑、滑移、足底支撑多边形、无接触、估计退化和高不确定性生成约束描述。
 
 示例约束包括：
 
 - `double_support: keep COM projection inside both feet support polygon`
 - `left_support: right foot may swing; keep ZMP near left foot`
+- `support_polygon_vertices: n=...`
+- `base_projection_inside_support_polygon: 1`
+- `com_projection_inside_support_polygon: 1`
+- `com_support_margin_m: 0.043`
+- `foot_slip_detected: ignore slipping foot as support and shorten next step`
 - `degenerate_estimation: reduce speed and increase perception weighting`
 - `high_uncertainty: inflate obstacle margins by 0.15 m`
 
@@ -176,6 +208,8 @@ X = {
 ### system
 
 - `DataBus`：保存最新 IMU、编码器、感知帧、全身状态和规划结果。
+- `SensorBuffer`：按时间戳缓存 IMU、编码器和感知帧；当前用于编码器插值和 joint delay 时间对齐诊断。
+- `StateHistoryBuffer`：按时间戳缓存估计状态；感知融合时按 `PerceptionFrame.t` 查询历史 base 位姿。
 - `RealTimeLoop`：项目主调度器，负责运行每个场景并写出结果文件。
 
 ### sensors
@@ -190,8 +224,8 @@ X = {
 
 `humanoid_system/visualization/plot_state.py` 读取单个场景目录下的 CSV 输出，绘制：
 
-- base 估计轨迹；
-- 左右脚接触时间线；
+- base 和 CoM 估计轨迹；
+- 左右脚接触时间线和滑移标志；
 - 协方差 trace；
 - semantic occupancy grid。
 
@@ -210,6 +244,19 @@ X = {
 cmake -S . -B build
 cmake --build build
 ```
+
+启用 Unitree G1 12DoF + Pinocchio/URDF 后端：
+
+```bash
+cmake -S . -B build_pinocchio \
+  -DHUMANOID_ENABLE_PINOCCHIO=ON \
+  -DHUMANOID_PINOCCHIO_FLOATING_BASE=ON \
+  -DCMAKE_PREFIX_PATH=/opt/ros/noetic
+cmake --build build_pinocchio
+./build_pinocchio/humanoid_system_demo build/outputs_pinocchio
+```
+
+Pinocchio 后端会在 `summary.txt` 中输出 `pinocchio_model_valid`、URDF 路径、左右足 frame、joint_order 和校验结果。
 
 运行全部仿真场景：
 
@@ -240,7 +287,7 @@ build/outputs/
 
 | 文件 | 内容 |
 | --- | --- |
-| `trajectory.csv` | 时间、base 位置速度、RPY、协方差 trace、退化标志 |
+| `trajectory.csv` | 时间、base/CoM 位置、base 速度、RPY、协方差 trace、退化标志 |
 | `contact_timeline.csv` | 左右脚接触状态、接触概率、接触稳定性 |
 | `objects.csv` | 目标 ID、类别、位置、速度、不确定性 |
 | `semantic_grid.csv` | 栅格坐标、占据概率、置信度、语义标签 |
@@ -268,7 +315,7 @@ visualization.png
 - `contact_false_detection`：脚高度/速度与高接触概率矛盾。
 - `sensor_dropout`：IMU、编码器或感知帧掉线，或更新时间间隔过长。
 - `delay_detected`：IMU 时间戳倒退。
-- `poorly_observed`：协方差 trace 过大或接触不稳定。
+- `poorly_observed`：协方差 trace 超过 45 维状态阈值、接触不稳定或当前传感器处于掉线状态。
 
 这些状态会影响：
 
@@ -284,14 +331,17 @@ visualization.png
 1. 在 `humanoid_system/sensors` 下实现 ROS2 或硬件 SDK 适配器。
 2. 将真实 IMU 转为 `ImuSample`，真实关节状态转为 `EncoderSample`。
 3. 将相机、LiDAR、语义分割、目标检测后端转为 `PerceptionFrame`。
-4. 替换 `KinematicsPinocchio` 中的简化运动学为真实 URDF/Pinocchio 模型。
+4. 用真实机器人 URDF 替换默认 G1 模型，并通过 `RobotModelConfig` 配置 joint_order、foot frame 和 floating base。
 5. 将 `PlannerOutput` 对接导航、步态生成或全身控制模块。
 6. 将 `DataBus` 扩展为线程安全消息通道，满足真实实时系统调度要求。
 
 ## 当前限制
 
 - 这是一个可运行的系统栈原型，运动学和传感器模型为了演示完整链路做了简化。
-- `KinematicsPinocchio` 当前是项目内部的简化正运动学接口，不需要链接外部 Pinocchio。
+- 默认构建仍使用解析 fallback；要使用真实 URDF/Pinocchio 运动学，需要开启 `HUMANOID_ENABLE_PINOCCHIO`。
+- 当前 G1 URDF 是开源参考模型，不等价于某台真实机器人的完整标定结果。
+- 接触模型仍以单足端 frame 为主，尚未升级为足底多点接触和接触力一致性约束。
+- 传感器时间同步已有编码器缓存/插值和感知历史状态查询，但仿真器还没有注入可控感知延迟。
 - 规划层输出 cost map 和约束描述，没有实现完整轨迹优化或足步规划。
 - 控制接口目前停留在约束/安全区域输出阶段，没有下发真实电机控制命令。
 - 传感器目录目前是适配层占位，真实部署需要补充 ROS2 message 或硬件驱动转换逻辑。
@@ -300,11 +350,17 @@ visualization.png
 
 如果想快速理解项目，可以按这个顺序读代码：
 
-1. `humanoid_system/main.cpp`
-2. `humanoid_system/system/real_time_loop.cpp`
-3. `humanoid_system/common/types.hpp`
-4. `humanoid_system/estimation/eskf_whole_body.cpp`
-5. `humanoid_system/world_model/semantic_map.cpp`
-6. `humanoid_system/planning/cost_map.cpp`
-7. `humanoid_system/simulation/scenario_generator.cpp`
-8. `humanoid_system/visualization/plot_state.py`
+1. `docs/implementation_plan.md`
+2. `docs/realism_gap.md`
+3. `humanoid_system/main.cpp`
+4. `humanoid_system/system/real_time_loop.cpp`
+5. `humanoid_system/common/types.hpp`
+6. `humanoid_system/robot_model/robot_model_config.cpp`
+7. `humanoid_system/system/sensor_buffer.cpp`
+8. `humanoid_system/system/state_history_buffer.cpp`
+9. `humanoid_system/estimation/eskf_whole_body.cpp`
+10. `humanoid_system/estimation/kinematics_pinocchio.cpp`
+11. `humanoid_system/world_model/semantic_map.cpp`
+12. `humanoid_system/planning/cost_map.cpp`
+13. `humanoid_system/simulation/scenario_generator.cpp`
+14. `humanoid_system/visualization/plot_state.py`

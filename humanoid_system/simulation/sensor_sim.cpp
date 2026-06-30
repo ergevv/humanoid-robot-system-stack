@@ -7,16 +7,35 @@ namespace humanoid {
 SensorSim::SensorSim(unsigned seed) : rng_(seed) {}
 
 double SensorSim::noise(double sigma) {
+  // unit_ 生成标准正态 N(0,1)，乘以 sigma 后得到 N(0,sigma^2)。
+  // sigma 越大，模拟的传感器噪声越强。
   return sigma * unit_(rng_);
 }
 
 ImuSample SensorSim::imu(const SimTruth& truth, const ScenarioConfig& scenario) {
+  // 掉线场景中，2.4s 到 2.75s 之间 IMU 无效。
+  // 这样可以测试估计器是否会限制 dt、增大不确定性并标记 sensor_dropout。
   const bool dropout = scenario.dropout && truth.t > 2.4 && truth.t < 2.75;
+
+  // IMU 加速度计通常测量 body 系下的“包含重力影响的加速度/比力”。
+  // 这里先把世界系线加速度 truth.linear_accel_w 加上 +g，
+  // 再用 R_wb.conjugate() 从 world 系旋到 body 系，模拟 IMU 安装在机器人本体上。
+  // 注意：这是简化模型，严格惯导中比力符号和重力补偿要根据传感器定义仔细约定。
   const Vec3 accel_body = truth.state.R_wb.conjugate().rotate(truth.linear_accel_w + Vec3{0.0, 0.0, kGravity});
+
+  // 构造一个很小的角速度真值，主要让姿态积分链路有非零输入。
+  // z 轴慢速摆动可理解为行走中的轻微 yaw 摆动。
   Vec3 gyro{0.0, 0.0, 0.018 * std::sin(truth.t)};
+
+  // 快速行走时额外加入 x 轴角速度扰动，模拟更激烈的身体俯仰/滚转动态。
   if (scenario.type == ScenarioType::FastWalking) {
     gyro.x += 0.08 * std::sin(8.0 * truth.t);
   }
+
+  // 给角速度和加速度分别叠加小高斯噪声：
+  //   gyro 噪声 sigma=0.004 rad/s；
+  //   accel 噪声 sigma=0.04 m/s^2。
+  // valid=false 时数据仍返回，但估计器会根据 valid 跳过或降权处理。
   return {truth.t,
           {gyro.x + noise(0.004), gyro.y + noise(0.004), gyro.z + noise(0.004)},
           {accel_body.x + noise(0.04), accel_body.y + noise(0.04), accel_body.z + noise(0.04)},
@@ -24,19 +43,31 @@ ImuSample SensorSim::imu(const SimTruth& truth, const ScenarioConfig& scenario) 
 }
 
 EncoderSample SensorSim::encoder(const SimTruth& truth, const ScenarioConfig& scenario) {
+  // 编码器观测直接从真值关节角/速度拷贝，再叠加噪声。
+  // 真实机器人中这里对应读取 joint state 或电机反馈。
   EncoderSample out;
   out.t = truth.t;
   out.q = truth.state.q_j;
   out.v = truth.state.v_j;
+
+  // 关节角噪声，sigma=0.003 rad，约 0.17 度。
   for (double& q : out.q) {
     q += noise(0.003);
   }
+
+  // 关节速度噪声，sigma=0.015 rad/s。
   for (double& v : out.v) {
     v += noise(0.015);
   }
-  if (scenario.contact_misdetection && truth.t > 2.0 && truth.t < 2.35 && out.v.size() > 1) {
-    out.v[1] += 9.5;
+
+  // 接触误检场景：在 2.0s 到 2.35s 人为给左膝速度加一个巨大异常量。
+  // 这样会触发 encoder_inconsistent，并间接测试 contact_false_detection。
+  // G1 12DoF 顺序中左膝是 index=3。
+  if (scenario.contact_misdetection && truth.t > 2.0 && truth.t < 2.35 && out.v.size() > 3) {
+    out.v[3] += 9.5;
   }
+
+  // 传感器掉线场景：3.7s 到 3.95s 编码器无效。
   out.valid = !(scenario.dropout && truth.t > 3.7 && truth.t < 3.95);
   return out;
 }
@@ -44,7 +75,7 @@ EncoderSample SensorSim::encoder(const SimTruth& truth, const ScenarioConfig& sc
 PerceptionFrame SensorSim::perception(const SimTruth& truth, const ScenarioConfig& scenario) {
   // 构造一帧简化感知数据，模拟相机/LiDAR 感知前端的输出。
   // PerceptionFrame 中包含两类信息：
-  //   1. points：点云点，表示地面/楼梯/静态障碍物的几何观测；
+  //   1. points + point_labels：点云点及其语义，表示地面/楼梯/静态障碍物的观测；
   //   2. detections：目标检测结果，表示可被语义检测器识别出的动态目标。
   PerceptionFrame frame;
   frame.t = truth.t;
@@ -69,12 +100,14 @@ PerceptionFrame SensorSim::perception(const SimTruth& truth, const ScenarioConfi
       // world - p_wb 得到从 base 指向该点的世界系向量；
       // R_wb.conjugate() 是 world 到 body 的逆旋转。
       frame.points.push_back(truth.state.R_wb.conjugate().rotate(world - truth.state.p_wb));
+      frame.point_labels.push_back(SemanticLabel::Ground);
     }
   }
 
-  // 生成一个静态障碍物点云，位置固定在机器人前方约 1.6m、左/右侧偏移 -0.75m、高度 0.45m。
+  // 生成一个世界系静态障碍物点云。
+  // 注意它不再跟随机器人 base 移动；机器人走近/远离时，body 系观测会自然变化。
   // 这里不是完整物体模型，而是用 24 个采样点围成一个简化圆柱/立柱状障碍物。
-  const Vec3 static_obstacle_w{truth.state.p_wb.x + 1.6, -0.75, 0.45};
+  const Vec3 static_obstacle_w{2.0, -0.75, 0.45};
   for (int k = 0; k < 24; ++k) {
     // a 是圆周角度，把 24 个点均匀分布在半径 0.18m 的圆周上。
     const double a = 2.0 * M_PI * static_cast<double>(k) / 24.0;
@@ -85,6 +118,7 @@ PerceptionFrame SensorSim::perception(const SimTruth& truth, const ScenarioConfi
 
     // 同样把静态障碍物的世界系点转换到 body 系，作为感知点云输出。
     frame.points.push_back(truth.state.R_wb.conjugate().rotate(p - truth.state.p_wb));
+    frame.point_labels.push_back(SemanticLabel::Obstacle);
   }
 
   // 生成一个动态目标检测结果。动态目标的位置真值由 HumanoidSim 维护，
