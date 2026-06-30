@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+
 """Plot humanoid stack demo outputs.
 
 Usage:
@@ -18,7 +18,7 @@ def read_csv(path):
 
 
 def main():
-    scenario_dir = Path(sys.argv[1] if len(sys.argv) > 1 else "outputs/flat_ground")
+    scenario_dir = Path(sys.argv[1] if len(sys.argv) > 1 else "build/outputs/flat_ground")
     traj = read_csv(scenario_dir / "trajectory.csv")
     contact = read_csv(scenario_dir / "contact_timeline.csv")
     grid = read_csv(scenario_dir / "semantic_grid.csv")

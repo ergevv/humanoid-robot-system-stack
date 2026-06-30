@@ -18,6 +18,8 @@ class HumanoidSim {
   explicit HumanoidSim(ScenarioConfig config);
 
   SimTruth step(double dt);
+  // 返回当前仿真时间，只读查询，不推进仿真状态。
+  double time() const { return truth_.t; }
   const ScenarioConfig& config() const { return config_; }
 
  private:

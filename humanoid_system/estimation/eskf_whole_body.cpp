@@ -125,34 +125,66 @@ void WholeBodyESKF::applyContactConstraint(const FootKinematics& feet) {
 }
 
 void WholeBodyESKF::detectFailures(const ImuSample* imu, const EncoderSample* encoder, const FootKinematics* feet) {
+  // 失效检测函数会被 predict() 和 updateEncoders() 复用：
+  //   imu != nullptr     表示本次有 IMU 数据，需要检查惯性测量是否异常；
+  //   encoder != nullptr 表示本次有编码器数据，需要检查关节速度是否可信；
+  //   feet != nullptr    表示本次已经算出足端运动学，需要检查接触判断是否自洽。
+  // 这种指针可空的写法可以让同一个函数按“当前已有的观测类型”执行对应检测。
   if (imu != nullptr) {
+    // IMU 异常/漂移的粗检测：
+    //   1. gyro.norm() > 1.8
+    //      角速度模长过大，可能表示陀螺仪测量异常、bias 漂移，或仿真中出现非预期冲击；
+    //   2. abs(accel.norm() - g) > 6.5
+    //      静止或正常行走时，加速度计模长通常应接近重力加速度 g，再叠加有限的运动加速度；
+    //      如果和 g 差距过大，说明加速度残差异常，可能会严重污染速度/位置积分。
+    // 这里不是严格统计检验，而是工程上的保护阈值，用来尽早标记“不应完全信任 IMU”。
     const bool bias_like = imu->gyro.norm() > 1.8 || std::abs(imu->accel.norm() - kGravity) > 6.5;
     if (bias_like) {
+      // 只在第一次触发时记录诊断消息，避免每一帧重复刷同样的错误信息。
       if (!failure_.imu_bias_drift) {
         failure_.messages.push_back("IMU bias drift suspected from abnormal gyro/accel residual.");
       }
       failure_.imu_bias_drift = true;
+
+      // 用很小的步长把异常测量的一部分吸收到 bias 估计里。
+      // 这样做的目的不是完成严谨的 bias EKF 更新，而是在简化系统中模拟“发现残差异常后缓慢修正零偏”。
+      // 系数很小，是为了避免一次异常观测立刻把 bg/ba 拉偏。
       state_.bg += imu->gyro * 0.0002;
       state_.ba += (imu->accel - Vec3{0.0, 0.0, kGravity}) * 0.0001;
     }
   }
+
   if (encoder != nullptr) {
+    // 编码器一致性检测：遍历所有关节速度，找到绝对值最大的速度。
+    // 正常步态下关节速度应处于有限范围；如果某个关节速度突然非常大，
+    // 往往意味着编码器读数跳变、通信错误，或者仿真中故意注入了异常。
     double max_abs_v = 0.0;
     for (double v : encoder->v) {
       max_abs_v = std::max(max_abs_v, std::abs(v));
     }
+
+    // 8.0 rad/s 是当前简化模型中的异常阈值。
+    // 触发后不仅认为 encoder 不一致，也会怀疑接触检测，因为接触概率依赖关节速度和足端速度。
     if (max_abs_v > 8.0) {
       if (!failure_.encoder_inconsistent) {
         failure_.messages.push_back("Encoder inconsistency detected from implausible joint velocity.");
       }
       failure_.encoder_inconsistent = true;
+
+      // 编码器速度异常会污染足端速度估计，而足端速度又是接触判断的重要输入。
+      // 所以这里同步标记 contact_false_detection，提醒规划和诊断模块不要盲信当前接触状态。
       if (!failure_.contact_false_detection) {
         failure_.messages.push_back("Contact false detection suspected from encoder/contact inconsistency.");
       }
       failure_.contact_false_detection = true;
     }
   }
+
   if (feet != nullptr) {
+    // 接触自洽性检测：
+    // 如果接触估计说“脚正在稳定接触地面”，但运动学显示脚离地太高或足端速度太大，
+    // 那么这个接触判断就很可能是误检。
+    // 这类误检很危险，因为错误接触约束会把 base 速度/位置估计强行拉偏。
     const bool false_contact = contact_.falseDetectionLikely(state_.contact, *feet);
     if (false_contact) {
       if (!failure_.contact_false_detection) {
@@ -161,6 +193,11 @@ void WholeBodyESKF::detectFailures(const ImuSample* imu, const EncoderSample* en
       failure_.contact_false_detection = true;
     }
   }
+
+  // 编码器掉线/延迟检测：
+  // 如果估计器当前时间 state_.t 已经比上一次编码器更新时间 last_encoder_t_ 晚超过 0.05s，
+  // 说明关节状态长时间没有更新。对于 100Hz 左右的编码器更新频率来说，50ms 已经是明显间隔。
+  // 编码器掉线会影响关节状态、足端运动学、接触估计和接触约束，因此统一标记 sensor_dropout。
   if (last_encoder_t_ > 0.0 && state_.t - last_encoder_t_ > 0.05) {
     if (!failure_.sensor_dropout) {
       failure_.messages.push_back("Encoder update gap detected.");

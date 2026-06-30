@@ -36,45 +36,78 @@ bool RealTimeLoop::runScenario(const ScenarioConfig& scenario) {
   PlannerOutput final_plan;
   constexpr double dt = 0.005;
   int step = 0;
-  while (sim.config().duration - sim.step(0.0).t > 0.0) {
+
+  // 主仿真循环：每次循环相当于真实机器人系统中的一个实时控制/感知周期。
+  // 这里使用 sim.time() 做只读时间判断，避免用 step(0.0) 触发状态更新和 dt 除零风险。
+  while (sim.config().duration - sim.time() > 0.0) {
+    // 推进仿真真值状态。truth 是当前时刻的理想真实状态，
+    // 后续所有传感器数据都会基于这个真值叠加噪声、掉线或误检。
     const SimTruth truth = sim.step(dt);
+
+    // 根据当前真值生成一帧传感器观测：
+    // IMU 用于高频状态传播，Encoder 用于关节/接触更新，PerceptionFrame 用于语义地图更新。
     ImuSample imu = sensors.imu(truth, scenario);
     EncoderSample encoder = sensors.encoder(truth, scenario);
     PerceptionFrame perception = sensors.perception(truth, scenario);
 
+    // 将最新传感器数据发布到 DataBus。
+    // 当前 DataBus 是轻量的“最新值缓存”，真实系统中可以替换为线程安全队列或 ROS2 topic。
     bus_.publish(imu);
     bus_.publish(encoder);
     bus_.publish(perception);
 
+    // 第一帧用编码器状态初始化全身估计器，主要同步时间戳和关节状态。
+    // 初始化只执行一次，之后估计器依靠 IMU predict 和 encoder update 持续递推。
     if (!initialized) {
       estimator_.initialize(truth.t, encoder);
       initialized = true;
     }
 
+    // 每个周期都执行 IMU 预测，相当于 200 Hz 高频惯性传播。
+    // predict 内部会更新姿态、速度、位置、协方差，并检查 IMU 掉线或时间异常。
     estimator_.predict(imu);
+
+    // 每 2 个仿真步更新一次编码器，相当于 100 Hz 关节/接触观测更新。
+    // updateEncoders 会刷新关节状态、估计左右脚接触，并施加接触约束修正 base 速度。
     if (step % 2 == 0) {
       estimator_.updateEncoders(encoder);
     }
+
+    // 每 4 个仿真步更新一次语义世界模型，相当于 50 Hz 感知/地图融合。
+    // 地图会融合点云和目标检测；随后反向给估计器提供地面高度和置信度提示。
     if (step % 4 == 0) {
       world_model_.updateFromPerception(perception, estimator_.state());
       const double ground_conf = world_model_.groundConfidenceNear(estimator_.state().p_wb);
       estimator_.applyMapContactHint(world_model_.groundHeightHint(estimator_.state()), ground_conf);
     }
+
+    // 每 20 个仿真步生成一次规划接口输出，相当于 10 Hz cost map/约束更新。
+    // final_plan 会保留最后一次规划结果，用于循环结束后写出 cost_map.csv 和 summary.txt。
     if (step % 20 == 0) {
       final_plan = cost_map.build(estimator_.state(), world_model_);
       bus_.publish(final_plan);
     }
 
+    // 获取当前估计状态并发布到 DataBus，供系统其他模块读取最新全身状态。
     const WholeBodyState& s = estimator_.state();
     bus_.publish(s);
+
+    // 将姿态四元数转换为 roll/pitch/yaw，便于 CSV 后处理和可视化脚本直接读取。
     const auto rpy = s.R_wb.rpy();
+
+    // 写出 base 轨迹、速度、姿态、协方差 trace 和退化标志。
+    // degenerate 为 1 时表示当前估计可能观测不足、接触不稳定或不确定性过高。
     traj << s.t << ',' << s.p_wb.x << ',' << s.p_wb.y << ',' << s.p_wb.z << ','
          << s.v_wb.x << ',' << s.v_wb.y << ',' << s.v_wb.z << ','
          << rpy[0] << ',' << rpy[1] << ',' << rpy[2] << ','
          << covarianceTrace(s) << ',' << (s.degenerate ? 1 : 0) << '\n';
+
+    // 写出左右脚接触状态、接触概率和接触稳定性，方便检查步态切换和误检场景。
     contacts << s.t << ',' << (s.contact.left ? 1 : 0) << ',' << (s.contact.right ? 1 : 0) << ','
              << s.contact.p_left << ',' << s.contact.p_right << ',' << (s.contact.stable ? 1 : 0) << '\n';
 
+    // 写出当前世界模型维护的所有动态目标轨迹。
+    // 每一行是同一时刻下一个 tracked object 的状态快照。
     for (const TrackedObject& object : world_model_.tracker().tracks()) {
       objects << s.t << ',' << object.id << ',' << object.label << ','
               << object.position.x << ',' << object.position.y << ',' << object.position.z << ','
@@ -82,6 +115,7 @@ bool RealTimeLoop::runScenario(const ScenarioConfig& scenario) {
               << object.uncertainty << '\n';
     }
 
+    // 步计数用于控制不同模块的运行频率，例如编码器 100 Hz、建图 50 Hz、规划 10 Hz。
     ++step;
   }
 

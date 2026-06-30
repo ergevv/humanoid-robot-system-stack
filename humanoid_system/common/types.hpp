@@ -135,24 +135,54 @@ struct PerceptionFrame {
 };
 
 struct ContactEstimate {
+  // 左脚是否被判定为接触地面；true 表示左脚可作为支撑脚参与状态约束和规划约束。
   bool left{false};
+
+  // 右脚是否被判定为接触地面；true 表示右脚可作为支撑脚参与状态约束和规划约束。
   bool right{false};
+
+  // 左脚接触概率，范围通常为 [0, 1]；数值越大表示左脚越可能处于稳定支撑状态。
   double p_left{0.0};
+
+  // 右脚接触概率，范围通常为 [0, 1]；数值越大表示右脚越可能处于稳定支撑状态。
   double p_right{0.0};
+
+  // 接触状态是否稳定；频繁切换、双脚均不接触或观测矛盾时可能变为 false。
   bool stable{true};
 };
 
 struct WholeBodyState {
+  // 状态时间戳，单位为秒；用于对齐 IMU、编码器、感知帧和规划输出。
   double t{0.0};
+
+  // 机体 base 相对于世界坐标系的姿态四元数，R_wb 表示从 body 系旋转到 world 系。
   Quat R_wb;
+
+  // 机体 base 在世界坐标系下的位置，单位为米；通常表示躯干/骨盆中心的估计位置。
   Vec3 p_wb;
+
+  // 机体 base 在世界坐标系下的线速度，单位为米/秒；由 IMU 传播并受接触约束修正。
   Vec3 v_wb;
+
+  // 陀螺仪零偏估计，单位为弧度/秒；用于从 IMU 角速度测量中扣除慢变 bias。
   Vec3 bg;
+
+  // 加速度计零偏估计，单位为米/秒^2；用于从 IMU 加速度测量中扣除慢变 bias。
   Vec3 ba;
+
+  // 关节位置向量，单位通常为弧度；当前简化模型中前 3 个为左腿，后 3 个为右腿。
   std::vector<double> q_j;
+
+  // 关节速度向量，单位通常为弧度/秒；与 q_j 一一对应，用于足端速度和接触估计。
   std::vector<double> v_j;
+
+  // 左右脚接触估计结果；会影响 ESKF 接触约束、退化检测和规划支撑约束。
   ContactEstimate contact;
+
+  // 误差状态协方差的对角近似，表示各状态维度的不确定性；trace 越大说明估计越不可靠。
   std::array<double, 15> covariance_diag{};
+
+  // 退化标志；true 表示当前状态可能观测不足、接触不稳定或不确定性过高，需要规划降级。
   bool degenerate{false};
 };
 
